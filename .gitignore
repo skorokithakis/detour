@@ -1,0 +1,6 @@
+# Go build artifacts
+/detour
+*.exe
+*.test
+*.out
+.coverprofile
