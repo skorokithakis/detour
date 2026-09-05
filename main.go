@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"html"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +16,17 @@ import (
 )
 
 const healthTimeout = 10 * time.Second
+
+// defaultFallbackURL is where visitors are sent during a total outage when the
+// operator has not configured FALLBACK_URL. The project's own page is the least
+// confusing landing spot: it explains what detour is, which is about all that
+// can be said when every backend is down.
+const defaultFallbackURL = "https://github.com/skorokithakis/detour"
+
+// redirectDelaySeconds is how long the no-backend page waits before sending the
+// visitor to the fallback URL. It is deliberately not configurable: five
+// seconds is enough to read the page and short enough not to strand anyone.
+const redirectDelaySeconds = 5
 
 var healthClient = &http.Client{
 	Timeout: healthTimeout,
@@ -30,6 +42,7 @@ type backend struct {
 
 type config struct {
 	backends         []*backend
+	fallbackURL      string
 	healthyThreshold int
 	interval         time.Duration
 	port             string
@@ -65,9 +78,11 @@ func main() {
 	log.Printf("listening on port %s with %d backends; check interval %s, healthy threshold %d", config.port, len(config.backends), config.interval, config.healthyThreshold)
 	go checker.run(config.interval)
 
+	unavailablePage := buildUnavailablePage(config.fallbackURL)
+
 	server := &http.Server{
 		Addr:              net.JoinHostPort("", config.port),
-		Handler:           redirectHandler(active),
+		Handler:           redirectHandler(active, unavailablePage),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -109,12 +124,23 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid HEALTHY_THRESHOLD %q", thresholdValue)
 	}
 
+	fallbackValue := os.Getenv("FALLBACK_URL")
+	if fallbackValue == "" {
+		fallbackValue = defaultFallbackURL
+	}
+	// url.Parse, not parseBackend: the fallback URL may carry a query string
+	// or fragment, and ParseRequestURI leaves fragments glued to the query.
+	parsedFallback, err := url.Parse(fallbackValue)
+	if err != nil || (parsedFallback.Scheme != "http" && parsedFallback.Scheme != "https") || parsedFallback.Hostname() == "" {
+		return config{}, fmt.Errorf("invalid FALLBACK_URL %q", fallbackValue)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	return config{backends: backends, healthyThreshold: healthyThreshold, interval: interval, port: port}, nil
+	return config{backends: backends, fallbackURL: fallbackValue, healthyThreshold: healthyThreshold, interval: interval, port: port}, nil
 }
 
 func parseBackend(raw string) (*backend, error) {
@@ -227,12 +253,50 @@ func isLive(healthURL string) bool {
 	return response.StatusCode == http.StatusOK
 }
 
-func redirectHandler(active *atomic.Pointer[backend]) http.Handler {
+// buildUnavailablePage renders the page served when every backend is down. The
+// page depends only on configuration, so it is rendered once at startup instead
+// of being rebuilt on every request of an outage. The redirect is a meta
+// refresh rather than a script or a Refresh header so the page still works with
+// scripting disabled and only uses standard behaviour.
+func buildUnavailablePage(fallbackURL string) string {
+	// The URL is operator configuration rather than user input, but a quote in
+	// it would still break out of the attribute it lands in, so every
+	// interpolation goes through EscapeString.
+	escapedFallbackURL := html.EscapeString(fallbackURL)
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="%d;url=%s">
+<title>No healthy backends</title>
+<style>
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: sans-serif; }
+main { text-align: center; padding: 0 1rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>No healthy backends</h1>
+<p>This service is unavailable. You will be redirected in %d seconds.</p>
+<p>If you are not redirected automatically, go to <a href="%s">%s</a>.</p>
+</main>
+</body>
+</html>
+`, redirectDelaySeconds, escapedFallbackURL, redirectDelaySeconds, escapedFallbackURL, escapedFallbackURL)
+}
+
+func redirectHandler(active *atomic.Pointer[backend], unavailablePage string) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
 		backend := active.Load()
 		if backend == nil {
-			http.Error(writer, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			// The status must stay 503 even though the page is human-readable:
+			// the service genuinely is unavailable and a 200 here would hide
+			// the outage from uptime monitoring. A meta refresh works inside a
+			// 503 body, so visitors are still sent onward.
+			writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(writer, unavailablePage)
 			return
 		}
 

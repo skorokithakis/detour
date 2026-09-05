@@ -3,9 +3,11 @@
 A tiny HTTP load balancer that answers with a `302` redirect instead of proxying.
 
 `detour` keeps a list of backends in priority order and checks their health in the
-background. Every request gets a `302 Found` pointing at the first healthy backend,
-with the original path and query string unchanged. The client then talks to that
-backend directly, so `detour` never carries any traffic itself.
+background. While at least one backend is healthy, every request gets a `302 Found`
+pointing at the first healthy one, with the original path and query string
+unchanged. The client then talks to that backend directly, so `detour` never
+carries any traffic itself. When no backend is healthy, it serves a `503` page
+instead.
 
 Because it only ever redirects, `detour` cannot see when a real request fails. The
 periodic health check is the only source of liveness.
@@ -18,12 +20,19 @@ All configuration is by environment variable.
 | --- | --- | --- | --- |
 | `BACKENDS` | yes | | Comma-separated base URLs, in priority order. |
 | `CHECK_INTERVAL` | no | `60s` | How often to check every backend. |
+| `FALLBACK_URL` | no | `https://github.com/skorokithakis/detour` | Where visitors are sent when no backend is healthy. Must be an absolute HTTP(S) URL, and may include a query string or fragment. |
 | `HEALTHY_THRESHOLD` | no | `3` | Consecutive successful checks before a backend counts as stable enough to claim the active slot. Minimum `1`. |
 | `PORT` | no | `8080` | Port to listen on. |
 
 A backend counts as healthy when `GET <backend>/` answers `200` within 10 seconds.
 All backends are checked in parallel, once at startup and then on every interval.
-If no backend is healthy, `detour` answers `503`.
+If no backend is healthy, `detour` answers `503` with a small HTML page. The page
+says there are no healthy backends, redirects the visitor to `FALLBACK_URL` after
+5 seconds via a meta refresh, and includes a plain link for anyone who is not
+redirected automatically. It uses inline CSS only, with no scripts or external
+assets, since the network those would load from may itself be part of the outage.
+The status stays `503` rather than `200` so uptime monitoring still sees the
+outage.
 
 Each backend carries a streak of consecutive successes: every successful check
 increments the streak and a single failure resets it to zero. The active slot goes
