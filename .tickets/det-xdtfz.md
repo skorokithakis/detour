@@ -1,6 +1,6 @@
 ---
 id: det-xdtfz
-status: open
+status: closed
 deps: [det-cpuup]
 links: []
 created: 2026-09-05T09:01:07Z
