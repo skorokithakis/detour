@@ -18,11 +18,36 @@ All configuration is by environment variable.
 | --- | --- | --- | --- |
 | `BACKENDS` | yes | | Comma-separated base URLs, in priority order. |
 | `CHECK_INTERVAL` | no | `60s` | How often to check every backend. |
+| `HEALTHY_THRESHOLD` | no | `3` | Consecutive successful checks before a backend counts as stable enough to claim the active slot. Minimum `1`. |
 | `PORT` | no | `8080` | Port to listen on. |
 
 A backend counts as healthy when `GET <backend>/` answers `200` within 10 seconds.
 All backends are checked in parallel, once at startup and then on every interval.
 If no backend is healthy, `detour` answers `503`.
+
+Each backend carries a streak of consecutive successes: every successful check
+increments the streak and a single failure resets it to zero. The active slot goes
+to the first backend in priority order whose streak has reached
+`HEALTHY_THRESHOLD`. This damping stops a flapping backend from repeatedly taking
+over the active slot: one failed check disqualifies it until it has stayed up for
+the whole threshold again — unless no backend has reached the threshold, in which
+case the fallback below can still select it.
+
+If no backend has reached the threshold, the first backend with at least one
+success wins anyway. A marginal backend beats a `503`: the first check runs
+immediately at startup, so a cold start selects a backend as soon as that first
+check completes, and a recovery from total outage waits at most one
+`CHECK_INTERVAL` for the next check — instead of `HEALTHY_THRESHOLD` x
+`CHECK_INTERVAL`. The tradeoff is a warmup window: for the first
+`HEALTHY_THRESHOLD - 1` intervals after startup no streak can have reached the
+threshold, so a backend that flaps from boot can still be selected. Damping
+engages as soon as at least one backend has reached the threshold; if no backend
+ever reaches it, the fallback rule governs indefinitely.
+
+The "backend X is up/down" log lines follow the raw probe result rather than the
+damped streak, so flapping stays visible in the logs. With the default settings a
+backend that alternates up and down on every check logs that alternation while
+never reaching the threshold.
 
 Lower `CHECK_INTERVAL` if you want failures noticed sooner. A backend that dies just
 after a check keeps receiving users until the next one.

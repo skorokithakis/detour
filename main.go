@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,16 +29,22 @@ type backend struct {
 }
 
 type config struct {
-	backends []*backend
-	interval time.Duration
-	port     string
+	backends         []*backend
+	healthyThreshold int
+	interval         time.Duration
+	port             string
 }
 
 type healthChecker struct {
-	backends []*backend
-	live     []bool
-	known    []bool
-	active   *atomic.Pointer[backend]
+	backends     []*backend
+	successCount []int
+	threshold    int
+	// firstCheck is true until the first check has run. The streak counters
+	// alone cannot distinguish "never checked" from "failed the last check",
+	// so the first check needs its own flag to report the state of every
+	// backend rather than just transitions.
+	firstCheck bool
+	active     *atomic.Pointer[backend]
 }
 
 func main() {
@@ -48,13 +55,14 @@ func main() {
 
 	active := &atomic.Pointer[backend]{}
 	checker := healthChecker{
-		backends: config.backends,
-		live:     make([]bool, len(config.backends)),
-		known:    make([]bool, len(config.backends)),
-		active:   active,
+		backends:     config.backends,
+		successCount: make([]int, len(config.backends)),
+		threshold:    config.healthyThreshold,
+		firstCheck:   true,
+		active:       active,
 	}
 
-	log.Printf("listening on port %s with %d backends; check interval %s", config.port, len(config.backends), config.interval)
+	log.Printf("listening on port %s with %d backends; check interval %s, healthy threshold %d", config.port, len(config.backends), config.interval, config.healthyThreshold)
 	go checker.run(config.interval)
 
 	server := &http.Server{
@@ -92,12 +100,21 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid CHECK_INTERVAL %q", intervalValue)
 	}
 
+	thresholdValue := os.Getenv("HEALTHY_THRESHOLD")
+	if thresholdValue == "" {
+		thresholdValue = "3"
+	}
+	healthyThreshold, err := strconv.Atoi(thresholdValue)
+	if err != nil || healthyThreshold < 1 {
+		return config{}, fmt.Errorf("invalid HEALTHY_THRESHOLD %q", thresholdValue)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	return config{backends: backends, interval: interval, port: port}, nil
+	return config{backends: backends, healthyThreshold: healthyThreshold, interval: interval, port: port}, nil
 }
 
 func parseBackend(raw string) (*backend, error) {
@@ -145,20 +162,27 @@ func (checker *healthChecker) check() {
 	}
 	waitGroup.Wait()
 
-	var next *backend
 	for index, backend := range checker.backends {
-		if checker.known[index] && results[index] != checker.live[index] {
-			state := "down"
-			if results[index] {
-				state = "up"
-			}
-			log.Printf("backend %s is %s", backend.base, state)
+		// The up/down log follows the raw probe result rather than the damped
+		// streak, so a flapping backend stays visible to operators. The first
+		// check logs every backend, up or down, so the startup state of the
+		// fleet is visible; afterwards only transitions are logged.
+		if results[index] && (checker.firstCheck || checker.successCount[index] == 0) {
+			log.Printf("backend %s is up", backend.base)
 		}
-		checker.live[index] = results[index]
-		checker.known[index] = true
-		if next == nil && results[index] {
-			next = backend
+		if !results[index] && (checker.firstCheck || checker.successCount[index] > 0) {
+			log.Printf("backend %s is down", backend.base)
 		}
+		if results[index] {
+			checker.successCount[index]++
+		} else {
+			checker.successCount[index] = 0
+		}
+	}
+
+	var next *backend
+	if chosen := selectBackendIndex(checker.successCount, checker.threshold); chosen != -1 {
+		next = checker.backends[chosen]
 	}
 
 	if previous := checker.active.Load(); previous != next {
@@ -169,6 +193,29 @@ func (checker *healthChecker) check() {
 			log.Printf("active backend changed to %s", next.base)
 		}
 	}
+
+	checker.firstCheck = false
+}
+
+// selectBackendIndex returns the index of the backend that should hold the
+// active slot, in priority order, or -1 when no backend has succeeded even once.
+//
+// The second pass is deliberate. Hysteresis exists to avoid unnecessary
+// switching, but with no backend at the threshold a marginal backend still beats
+// a 503. Without the second pass, cold start and recovery from a total outage
+// would each cost threshold x CHECK_INTERVAL of downtime.
+func selectBackendIndex(successCounts []int, threshold int) int {
+	for index, count := range successCounts {
+		if count >= threshold {
+			return index
+		}
+	}
+	for index, count := range successCounts {
+		if count >= 1 {
+			return index
+		}
+	}
+	return -1
 }
 
 func isLive(healthURL string) bool {
